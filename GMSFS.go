@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,8 +22,10 @@ type FileInfo struct {
 	LastModified time.Time
 	IsDir        bool
 	Contents     []string // Names of files for directories
-	OriginalName string
+	Name         string
 }
+
+const timeFlat = "20060102_1504"
 
 // Global variables for caches
 var FileCache = cmap.New[FileInfo]()
@@ -35,6 +39,26 @@ var FileTimers = cmap.New[*time.Timer]()
 type FileHandleInstance struct {
 	File  *os.File
 	Timer *time.Timer
+}
+
+func errorPrinter(log string) {
+	if _, err := os.Stat("GMSFS.Debug"); err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+	}
+
+	stack := ""
+	pc, _, _, ok := runtime.Caller(2) // 2 level up the call stack
+	if ok {
+		fn := runtime.FuncForPC(pc)
+		if fn != nil {
+			file, line := fn.FileLine(fn.Entry())
+			stack = " (2):" + fn.Name() + " file: " + file + " line: " + strconv.Itoa(line)
+		}
+	}
+
+	AppendStringToFile("GMSFS."+time.Now().Format(timeFlat)+".log", log+" stacktrace: "+stack+"\r\n")
 }
 
 func GetFileInfo(name string) (FileInfo, bool) {
@@ -73,6 +97,7 @@ func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 	file, err := os.OpenFile(name, flag, perm)
 	if err != nil {
+		errorPrinter("OpenFile: " + err.Error())
 		return nil, err
 	}
 
@@ -91,19 +116,26 @@ func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 func CloseFile(name string) {
 	lowerCaseName := strings.ToLower(filepath.Clean(name))
-	if file, ok := FileHandles.Get(lowerCaseName); ok {
-		stat, err := file.Stat()
-		if err == nil {
-			UpdateFileInfoWithSize(name, stat.Size())
-		}
-		file.Close()
-		FileHandles.Remove(lowerCaseName)
-	}
-	if timer, ok := FileTimers.Get(lowerCaseName); ok {
-		timer.Stop()
-		FileTimers.Remove(lowerCaseName)
-	}
 
+	// Iterate over all file handles and close those in the specified directory
+	for _, key := range FileHandles.Keys() {
+		if strings.HasPrefix(key, lowerCaseName) {
+			// Close individual file handle
+			if file, ok := FileHandles.Get(key); ok {
+				stat, err := file.Stat()
+				if err == nil {
+					UpdateFileInfoWithSize(key, stat.Size())
+				}
+				file.Close()
+				FileHandles.Remove(key)
+			}
+
+			if timer, ok := FileTimers.Get(key); ok {
+				timer.Stop()
+				FileTimers.Remove(key)
+			}
+		}
+	}
 }
 
 func resetTimer(name string) {
@@ -118,36 +150,47 @@ func resetTimer(name string) {
 	}
 }
 
-func Create(name string) (*os.File, error) {
-	name = filepath.Clean(name)
-	lowerCaseName := strings.ToLower(name)
+type CachedFile struct {
+	*os.File
+	path string
+}
 
-	file, err := os.Create(name)
+func (cf *CachedFile) Close() error {
+	// Update file info in cache before closing
+	stat, err := cf.File.Stat()
 	if err != nil {
-		return nil, err
-	}
-
-	stat, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, err
+		errorPrinter("Close: " + err.Error())
+		return err // or handle error differently
 	}
 
 	fileInfo := FileInfo{
 		Exists:       true,
-		Size:         0, // New file has size 0
+		Size:         stat.Size(),
 		Mode:         stat.Mode(),
 		LastModified: stat.ModTime(),
 		IsDir:        false,
-		OriginalName: name,
+		Name:         filepath.Base(cf.path),
 	}
-	FileCache.Set(lowerCaseName, fileInfo)
 
-	dir, fileX := filepath.Split(name)
-	updateCacheWithNewFile(dir, fileX)
-	UpdateDirectoryContents(dir)
+	lowerCasePath := strings.ToLower(cf.path)
+	FileCache.Set(lowerCasePath, fileInfo)
+	updateCacheWithNewFile(filepath.Dir(cf.path), filepath.Base(cf.path))
 
-	return file, nil
+	// Now close the file
+	return cf.File.Close()
+}
+
+func Create(name string) (*CachedFile, error) {
+	name = filepath.Clean(name)
+
+	file, err := os.Create(name)
+	if err != nil {
+		errorPrinter("Create: " + err.Error())
+		return nil, err
+	}
+
+	// Wrap the *os.File in CachedFile
+	return &CachedFile{File: file, path: name}, nil
 }
 
 func Open(name string) (*os.File, error) {
@@ -157,6 +200,7 @@ func Open(name string) (*os.File, error) {
 	// Open the file using os.Open
 	file, err := os.Open(name)
 	if err != nil {
+		errorPrinter("Open: " + err.Error())
 		return nil, err
 	}
 
@@ -165,6 +209,7 @@ func Open(name string) (*os.File, error) {
 		// If not in cache, get file info and update cache
 		stat, err := file.Stat()
 		if err != nil {
+			errorPrinter("Open: " + err.Error())
 			file.Close()
 			return nil, err
 		}
@@ -175,7 +220,7 @@ func Open(name string) (*os.File, error) {
 			Mode:         stat.Mode(),
 			LastModified: stat.ModTime(),
 			IsDir:        stat.IsDir(),
-			OriginalName: name,
+			Name:         name,
 		}
 		FileCache.Set(lowerCaseName, fileInfo)
 	}
@@ -194,6 +239,7 @@ func Delete(name string) error {
 	// Remove the file from the filesystem
 	err := os.Remove(name) // Use original case for filesystem operations
 	if err != nil {
+		errorPrinter("Delete: " + err.Error())
 		return err
 	}
 
@@ -203,6 +249,81 @@ func Delete(name string) error {
 	// Optionally, update the directory contents in the cache
 	UpdateDirectoryContents(filepath.Dir(lowerCaseName))
 	removeObjectFromParentCache(filepath.Dir(name), filepath.Base(name))
+	return nil
+}
+
+func ReadFile(name string) ([]byte, error) {
+	lowerCaseName := strings.ToLower(filepath.Clean(name))
+	// Close any open file handle before reading
+	CloseFile(lowerCaseName)
+
+	// Read the file contents
+	content, err := os.ReadFile(name) // Use the original case for filesystem operations
+	if err != nil {
+		errorPrinter("ReadFile: " + err.Error())
+		return nil, err
+	}
+
+	// Update the cache with the current file information
+	UpdateFileInfo(name) // Use the original case for updating FileInfo
+
+	return content, nil
+}
+
+func FileExists(name string) bool {
+	lowerCaseName := strings.ToLower(filepath.Clean(name))
+	if temp, ok := FileCache.Get(lowerCaseName); ok {
+		fileInfo := temp
+		return fileInfo.Exists
+	}
+
+	_, err := Stat(name)
+	if os.IsNotExist(err) {
+		FileCache.Set(lowerCaseName, FileInfo{Exists: false})
+		return false
+	} else if err == nil {
+		UpdateFileInfo(name)
+		return true
+	}
+	return false
+}
+
+func Mkdir(name string, perm os.FileMode) error {
+	name = filepath.Clean(name) // Preserve original name for file operation
+	err := os.Mkdir(name, perm)
+	if err != nil {
+		errorPrinter("Mkdir: " + err.Error())
+		return err
+	}
+
+	UpdateFileInfo(name) // Use the original name
+	updateCacheWithNewFile(filepath.Dir(name), filepath.Base(name))
+	return nil
+}
+
+func MkdirAll(path string, perm os.FileMode) error {
+	path = filepath.Clean(path) // Preserve original path for file operation
+
+	if FileExists(path) == true {
+		return nil
+	}
+
+	fpath := strings.Replace(path, "\\", "/", -1)
+	ps := strings.Split(fpath, "/")
+	newPath := "/"
+	for _, b := range ps {
+		if FileExists(filepath.Join(newPath, b)) == false {
+			errO := os.Mkdir(filepath.Join(newPath, b), perm)
+			if errO != nil {
+				errorPrinter("MkdirAll: " + errO.Error())
+				return errO
+			}
+			UpdateFileInfo(filepath.Join(newPath, b))
+			updateCacheWithNewFile(newPath, b)
+		}
+		newPath = newPath + "/" + b
+	}
+
 	return nil
 }
 
@@ -221,17 +342,19 @@ func Append(name string, content []byte) error {
 			return err
 		}
 		FileHandles.Set(lowerCaseName, file)
-		defer file.Close() // Ensure the file is closed after writing
 	}
 
 	// Write the content to the file
 	written, err := file.Write(content)
 	if err != nil {
+		errorPrinter("Append: " + err.Error())
 		return err
 	}
 
 	// Reset the timer for the file handle
 	resetTimer(lowerCaseName)
+
+	UpdateFileInfo(name)
 
 	// Update file info in the cache
 	UpdateFileInfoWithSize(lowerCaseName, int64(written))
@@ -239,93 +362,8 @@ func Append(name string, content []byte) error {
 	return nil
 }
 
-func ReadFile(name string) ([]byte, error) {
-	lowerCaseName := strings.ToLower(filepath.Clean(name))
-	// Close any open file handle before reading
-	CloseFile(lowerCaseName)
-
-	// Read the file contents
-	content, err := os.ReadFile(name) // Use the original case for filesystem operations
-	if err != nil {
-		return nil, err
-	}
-
-	// Update the cache with the current file information
-	UpdateFileInfo(name) // Use the original case for updating FileInfo
-
-	return content, nil
-}
-
-func FileExists(name string) bool {
-	lowerCaseName := strings.ToLower(filepath.Clean(name))
-	if temp, ok := FileCache.Get(lowerCaseName); ok {
-		fileInfo := temp
-		return fileInfo.Exists
-	}
-
-	_, err := os.Stat(name)
-	if os.IsNotExist(err) {
-		FileCache.Set(lowerCaseName, FileInfo{Exists: false})
-		return false
-	} else if err == nil {
-		UpdateFileInfo(name)
-		return true
-	}
-	return false
-}
-
-func Mkdir(name string, perm os.FileMode) error {
-	name = filepath.Clean(name) // Preserve original name for file operation
-	err := os.Mkdir(name, perm)
-	if err != nil {
-		return err
-	}
-
-	UpdateFileInfo(name) // Use the original name
-	updateCacheWithNewFile(filepath.Dir(name), filepath.Base(name))
-	return nil
-}
-
-func MkdirAll(path string, perm os.FileMode) error {
-	path = filepath.Clean(path) // Preserve original path for file operation
-	err := os.MkdirAll(path, perm)
-	if err != nil {
-		return err
-	}
-
-	UpdateFileInfo(path) // Use the original path
-	updateCacheWithNewFile(filepath.Dir(path), filepath.Base(path))
-	return nil
-}
-
 func AppendStringToFile(name string, content string) error {
-	lowerCaseName := strings.ToLower(name)
-
-	// Open or create the file
-	file, err := OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Append the content
-	written, err := file.Write([]byte(content))
-	if err != nil {
-		return err
-	}
-
-	// Update file size in the cache
-	if fileInfo, ok := FileCache.Get(lowerCaseName); ok {
-		updatedFileInfo := fileInfo
-		updatedFileInfo.Size += int64(written) // Update the size
-		FileCache.Set(lowerCaseName, updatedFileInfo)
-	} else {
-		// If file info is not in cache, fetch and update it
-		UpdateFileInfo(name)
-		updateCacheWithNewFile(filepath.Dir(name), filepath.Base(name))
-	}
-
-	return nil
+	return Append(name, []byte(content))
 }
 
 func WriteFile(name string, content []byte, perm os.FileMode) error {
@@ -338,6 +376,7 @@ func WriteFile(name string, content []byte, perm os.FileMode) error {
 	// Write the new content to the file
 	err := os.WriteFile(name, content, perm)
 	if err != nil {
+		errorPrinter("WriteFile: " + err.Error())
 		return err
 	}
 
@@ -363,6 +402,7 @@ func FileSize(name string) (int64, error) {
 	// If not in cache, get file size from the filesystem
 	stat, err := os.Stat(name) // Original name for filesystem operation
 	if err != nil {
+		errorPrinter("FileSize: " + err.Error())
 		return 0, err // File does not exist or other error occurred
 	}
 
@@ -398,25 +438,30 @@ func Rename(oldName, newName string) error {
 	lowerOldName := strings.ToLower(filepath.Clean(oldName))
 	lowerNewName := strings.ToLower(filepath.Clean(newName))
 
-	CloseFile(lowerOldName)
+	if FileCache.Has(lowerOldName) == false {
+		ListFS(lowerOldName)
+	}
 
+	CloseFile(lowerOldName)
 	err := os.Rename(oldName, newName)
 	if err != nil {
+		errorPrinter("Rename: " + err.Error())
 		return err
 	}
 
 	if fileInfo, ok := FileCache.Get(lowerOldName); ok {
-		if fileInfo.IsDir == true {
+		fileInfo.Name = filepath.Base(newName) // Update with the new name
+
+		if fileInfo.IsDir {
 			UpdateCacheForRenamedDirectory(filepath.Clean(oldName), filepath.Clean(newName))
-			updateCacheWithNewFile(filepath.Dir(newName), filepath.Base(newName))
 		} else {
-			fileInfo.OriginalName = filepath.Base(newName) // Preserve the full new name
+			// Update the cache with the new file information
 			FileCache.Set(lowerNewName, fileInfo)
 			FileCache.Remove(lowerOldName)
 
-			dir, file := filepath.Split(lowerOldName)
-			removeObjectFromParentCache(dir, file)
+			// Update parent directory's cache for both old and new locations
 			updateCacheWithNewFile(filepath.Dir(newName), filepath.Base(newName))
+			removeObjectFromParentCache(filepath.Dir(oldName), filepath.Base(oldName))
 		}
 	}
 
@@ -429,12 +474,14 @@ func CopyFile(src, dst string) (err error) {
 
 	in, err := os.Open(src)
 	if err != nil {
+		errorPrinter("CopyFile (os.Open): " + err.Error())
 		return
 	}
 	defer in.Close()
 
 	out, err := os.Create(dst)
 	if err != nil {
+		errorPrinter("CopyFile (os.Create): " + err.Error())
 		return
 	}
 	defer func() {
@@ -445,20 +492,24 @@ func CopyFile(src, dst string) (err error) {
 
 	_, err = io.Copy(out, in)
 	if err != nil {
+		errorPrinter("CopyFile (io.Copy): " + err.Error())
 		return
 	}
 
 	err = out.Sync()
 	if err != nil {
+		errorPrinter("CopyFile (out.Sync): " + err.Error())
 		return
 	}
 
 	si, err := os.Stat(src)
 	if err != nil {
+		errorPrinter("CopyFile (os.Stat): " + err.Error())
 		return
 	}
 	err = os.Chmod(dst, si.Mode())
 	if err != nil {
+		errorPrinter("CopyFile (os.Chmod): " + err.Error())
 		return
 	}
 
@@ -476,6 +527,7 @@ func Remove(name string) error {
 
 	err := os.Remove(name)
 	if err != nil {
+		errorPrinter("Remove: " + err.Error())
 		return err
 	}
 
@@ -491,44 +543,57 @@ func CopyDir(src string, dst string) error {
 	src = filepath.Clean(src)
 	dst = filepath.Clean(dst)
 
+	if FileCache.Has(strings.ToLower(src)) == false {
+		ListFS(strings.ToLower(src))
+	}
+
 	si, err := Stat(src) // Stat uses cache
 	if err != nil {
+		errorPrinter("CopyDir (Stat): " + err.Error())
 		return err
 	}
 	if !si.IsDir {
 		return fmt.Errorf("source is not a directory")
 	}
 
-	_, err = os.Stat(dst)
-	if err != nil && !os.IsNotExist(err) {
+	_, err = Stat(dst)
+	if err != nil {
+		errorPrinter("CopyDir (os.Stat): " + err.Error())
+		return err
+	}
+	if !os.IsNotExist(err) {
 		return err
 	}
 	if err == nil {
+		errorPrinter("CopyDir: " + err.Error())
 		return fmt.Errorf("destination already exists")
 	}
 
-	err = os.MkdirAll(dst, si.Mode)
+	err = MkdirAll(dst, si.Mode)
 	if err != nil {
+		errorPrinter("CopyDir (os.MkdirAll): " + err.Error())
 		return err
 	}
 	UpdateFileInfo(dst) // Update cache for the new directory
 
 	entries, err := ReadDir(src) // ReadDir uses cache
 	if err != nil {
+		errorPrinter("CopyDir (ReadDir): " + err.Error())
 		return err
 	}
 
 	for _, entry := range entries {
-		srcPath := filepath.Join(src, entry.OriginalName)
-		dstPath := filepath.Join(dst, entry.OriginalName)
+		srcPath := filepath.Join(src, entry.Name)
+		dstPath := filepath.Join(dst, entry.Name)
 
 		if entry.IsDir {
 			err = CopyDir(srcPath, dstPath)
 			if err != nil {
+				errorPrinter("CopyDir (CopyDir): " + err.Error())
 				return err
 			}
 			UpdateDirectoryContents(dstPath)
-			updateCacheWithNewFile(dstPath, entry.OriginalName)
+			updateCacheWithNewFile(dstPath, entry.Name)
 		} else {
 			// Skip symlinks
 			if entry.Mode&os.ModeSymlink != 0 {
@@ -537,9 +602,10 @@ func CopyDir(src string, dst string) error {
 
 			err = CopyFile(srcPath, dstPath)
 			if err != nil {
+				errorPrinter("CopyDir (CopyFile): " + err.Error())
 				return err
 			}
-			updateCacheWithNewFile(dstPath, entry.OriginalName)
+			updateCacheWithNewFile(dstPath, entry.Name)
 			//UpdateFileInfo(dstPath) // Update cache for the new file
 		}
 	}
@@ -556,6 +622,7 @@ func ReadDir(dirName string) ([]FileInfo, error) {
 		for _, fileName := range temp.Contents {
 			fileInfo, err := Stat(filepath.Join(dirName, fileName))
 			if err != nil {
+				errorPrinter("ReadDir (Stat): " + err.Error())
 				return nil, err // Handle error appropriately
 			}
 			fileInfos = append(fileInfos, fileInfo)
@@ -564,29 +631,44 @@ func ReadDir(dirName string) ([]FileInfo, error) {
 	}
 
 	// If not in cache, read directory contents from the filesystem
-	fileEntries, err := ReadDir(dirName)
+	fileEntries, err := os.ReadDir(dirName)
 	if err != nil {
+		errorPrinter("ReadDir (os.ReadDir): " + err.Error())
 		return nil, err
 	}
 
 	var contents []string
 	var fileInfos []FileInfo
 	for _, entry := range fileEntries {
+		entryStat, err := entry.Info()
 		if err != nil {
+			errorPrinter("ReadDir (loop): " + err.Error())
 			return nil, err
 		}
-		if entry.IsDir == true {
-			UpdateDirectoryContents(filepath.Join(dirName, entry.OriginalName))
+
+		// Convert os.FileInfo to your FileInfo struct
+		fileInfo := FileInfo{
+			Exists:       true,
+			Size:         entryStat.Size(),
+			Mode:         entryStat.Mode(),
+			LastModified: entryStat.ModTime(),
+			IsDir:        entryStat.IsDir(),
+			Name:         entryStat.Name(),
 		}
-		fileInfos = append(fileInfos, entry)
-		contents = append(contents, entry.OriginalName)
+
+		if entryStat.IsDir() {
+			UpdateDirectoryContents(filepath.Join(dirName, entryStat.Name()))
+		}
+
+		fileInfos = append(fileInfos, fileInfo)
+		contents = append(contents, entryStat.Name())
 	}
 	dirNameOnly := filepath.Base(dirName)
 	FileCache.Set(lowerCaseDirName, FileInfo{
-		Exists:       true,
-		IsDir:        true,
-		Contents:     contents,
-		OriginalName: dirNameOnly,
+		Exists:   true,
+		IsDir:    true,
+		Contents: contents,
+		Name:     dirNameOnly,
 	})
 
 	return fileInfos, nil
@@ -596,6 +678,7 @@ func RemoveAll(path string) error {
 	path = filepath.Clean(path)
 	err := updateCacheAfterRemoveAll(strings.ToLower(path))
 	if err != nil {
+		errorPrinter("Remove: " + err.Error())
 		return err
 	}
 
@@ -608,7 +691,11 @@ func ListFS(path string) []string {
 
 	// First, check if the path is a directory
 	fileInfo, err := Stat(path)
-	if err != nil || !fileInfo.IsDir {
+	if err != nil {
+		errorPrinter("ListFS (Stat): " + err.Error())
+		return sysSlices // Return empty slice if there's an error
+	}
+	if !fileInfo.IsDir {
 		return sysSlices // Return empty slice if it's not a directory
 	}
 
@@ -621,11 +708,13 @@ func ListFS(path string) []string {
 			f, err := Stat(fullPath)
 			if err == nil {
 				if f.IsDir {
-					sysSlices = append(sysSlices, "*"+f.OriginalName)
+					sysSlices = append(sysSlices, "*"+f.Name)
 					UpdateDirectoryContents(fullPath)
 				} else {
-					sysSlices = append(sysSlices, f.OriginalName)
+					sysSlices = append(sysSlices, f.Name)
 				}
+			} else {
+				errorPrinter("ListFS (Loop): " + err.Error())
 			}
 		}
 	} else {
@@ -647,6 +736,7 @@ func RecurseFS(path string) (sysSlices []string) {
 		for _, name := range temp.Contents {
 			fileInfo, err := Stat(filepath.Join(path, name)) // Use original path for stat
 			if err != nil {
+				errorPrinter("RecureseFS (Stat): " + err.Error())
 				continue // Handle error as needed
 			}
 			files = append(files, fileInfo)
@@ -655,17 +745,17 @@ func RecurseFS(path string) (sysSlices []string) {
 		var err error
 		files, err = ReadDir(path) // Read from filesystem if not in cache
 		if err != nil {
+			errorPrinter("RecurseFS (ReadDir): " + err.Error())
 			return // Handle error as needed
 		}
-		// Update the cache here if needed
 	}
 
 	for _, f := range files {
-		fullPath := path + "/" + f.OriginalName
+		fullPath := path + "/" + f.Name
 		if f.IsDir {
 			sysSlices = append(sysSlices, "*"+fullPath)
-			sysSlices = append(sysSlices, RecurseFS(fullPath)...)
-			UpdateDirectoryContents(filepath.Join(path, f.OriginalName))
+			childSlices := RecurseFS(fullPath)
+			sysSlices = append(sysSlices, childSlices...)
 		} else {
 			sysSlices = append(sysSlices, fullPath)
 		}
@@ -684,6 +774,7 @@ func FileAgeInSec(filename string) (age time.Duration, err error) {
 		var stat FileInfo
 		stat, err = Stat(filename)
 		if err != nil {
+			errorPrinter("FileAgeInSec: " + err.Error())
 			return -1, err
 		}
 
@@ -693,7 +784,7 @@ func FileAgeInSec(filename string) (age time.Duration, err error) {
 			Mode:         stat.Mode,
 			LastModified: stat.LastModified,
 			IsDir:        stat.IsDir,
-			OriginalName: filename,
+			Name:         filename,
 		}
 		FileCache.Set(lowerCaseFilename, fileInfo)
 	}
@@ -707,7 +798,11 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 
 	// Check if source is a directory
 	srcInfo, err := Stat(src) // Use cached Stat
-	if err != nil || !srcInfo.IsDir {
+	if err != nil {
+		errorPrinter("CopyDirFilesGlob: " + err.Error())
+		return fmt.Errorf("source is not a directory or does not exist")
+	}
+	if !srcInfo.IsDir {
 		return fmt.Errorf("source is not a directory or does not exist")
 	}
 
@@ -715,6 +810,7 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 	if !FileExists(dst) {
 		err = MkdirAll(dst, srcInfo.Mode) // Use cached MkdirAll
 		if err != nil {
+			errorPrinter("CopyDirFilesGlob (MkdirAll): " + err.Error())
 			return
 		}
 	}
@@ -722,6 +818,7 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 	// Use CachedGlob to match files
 	matches, err := Glob(src + "/" + fileMatch)
 	if err != nil {
+		errorPrinter("CopyDirFilesGlob (Glob): " + err.Error())
 		return err
 	}
 
@@ -729,6 +826,7 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 		itemBaseName := filepath.Base(item)
 		err = CopyFile(item, filepath.Join(dst, itemBaseName)) // Use cached CopyFile
 		if err != nil {
+			errorPrinter("CopyDirFilesGlob (CopyFile): " + err.Error())
 			return
 		}
 	}
@@ -742,6 +840,7 @@ func Glob(pattern string) ([]string, error) {
 	// First, try to match the pattern with files in the cache
 	cachedMatches, errorZ := CachedGlob(pattern)
 	if errorZ != nil {
+		errorPrinter("Glob: " + errorZ.Error())
 		return nil, errorZ
 	}
 
@@ -763,12 +862,13 @@ func CachedGlob(pattern string) ([]string, error) {
 	// Iterate through all items in the cache
 	for _, key := range FileCache.Keys() {
 		if fileInfo, ok := FileCache.Get(key); ok {
-			matched, err := filepath.Match(lowerCasePattern, strings.ToLower(fileInfo.OriginalName))
+			matched, err := filepath.Match(lowerCasePattern, strings.ToLower(fileInfo.Name))
 			if err != nil {
+				errorPrinter("CachedGlob: " + err.Error())
 				return nil, err
 			}
 			if matched {
-				matches = append(matches, fileInfo.OriginalName)
+				matches = append(matches, fileInfo.Name)
 			}
 		}
 	}
@@ -798,7 +898,7 @@ func Stat(name string) (FileInfo, error) {
 		Mode:         stat.Mode(),
 		LastModified: stat.ModTime(),
 		IsDir:        stat.IsDir(),
-		OriginalName: dirNameOnly, // Store the original name
+		Name:         dirNameOnly, // Store the original name
 	}
 
 	// Update the cache with this new information
@@ -817,7 +917,7 @@ func Update(name string, info FileInfo) {
 	if info.Exists {
 		// Preserve the original name in FileInfo
 		namex := filepath.Base(name)
-		info.OriginalName = namex
+		info.Name = namex
 		FileCache.Set(lowerCaseName, info)
 	} else {
 		FileCache.Remove(lowerCaseName)
@@ -827,17 +927,22 @@ func Update(name string, info FileInfo) {
 func updateCacheAfterRemoveAll(path string) error {
 	lowerCasePath := strings.ToLower(filepath.Clean(path))
 
-	entries, err := os.ReadDir(path) // Original case for filesystem operation
-	if err != nil && !os.IsNotExist(err) {
+	entries, err := ReadDir(path) // Original case for filesystem operation
+	if err != nil {
+		errorPrinter("updateCacheAfterRemoveAll: " + err.Error())
+		return err
+	}
+	if !os.IsNotExist(err) {
 		return err
 	}
 
 	for _, entry := range entries {
-		fullPath := filepath.Join(path, entry.Name())
+		fullPath := filepath.Join(path, entry.Name)
 		lowerCaseFullPath := strings.ToLower(fullPath)
-		if entry.IsDir() {
+		if entry.IsDir {
 			err := updateCacheAfterRemoveAll(lowerCaseFullPath)
 			if err != nil {
+				errorPrinter("updateCacheAfterRemoveAll (updateCacheAfterRemoveAll): " + err.Error())
 				return err
 			}
 		}
@@ -912,14 +1017,14 @@ func UpdateCacheForRenamedDirectory(oldDir, newDir string) {
 
 			// Update the cache entry for each file/subdirectory
 			if fileInfo, ok := FileCache.Get(oldPath); ok {
-				fileInfo.OriginalName = filepath.Base(newPath) // Update OriginalName
+				fileInfo.Name = filepath.Base(newPath) // Update OriginalName
 				FileCache.Set(newPath, fileInfo)
 				FileCache.Remove(oldPath)
 			}
 		}
 
 		// Finally, update the cache entry for the directory itself
-		dirInfo.OriginalName = filepath.Base(newDir)
+		dirInfo.Name = filepath.Base(newDir)
 		FileCache.Set(newDir, dirInfo)
 		FileCache.Remove(oldDir)
 	}
@@ -959,7 +1064,7 @@ func UpdateFileInfo(name string) {
 			Mode:         stat.Mode(),
 			LastModified: stat.ModTime(),
 			IsDir:        stat.IsDir(),
-			OriginalName: stat.Name(), // Preserve the original file name
+			Name:         stat.Name(), // Preserve the original file name
 		}
 	}
 
@@ -976,6 +1081,7 @@ func UpdateDirectoryContents(dirName string) {
 
 	files, err := os.ReadDir(dirName) // Use the original case for filesystem operations
 	if err != nil {
+		errorPrinter("UpdateDirectoryContents (os.ReadDir): " + err.Error())
 		return // Handle error
 	}
 
@@ -984,13 +1090,14 @@ func UpdateDirectoryContents(dirName string) {
 		contents = append(contents, file.Name())
 	}
 
-	dstat, err := os.Stat(dirName)
+	dstat, err := Stat(dirName)
 	if err != nil {
+		errorPrinter("UpdateDirectoryContents (Stat): " + err.Error())
 		return
 	}
 
 	dirNameOnly := filepath.Base(dirName) // Get only the directory name
-	dirInfo := FileInfo{Exists: true, IsDir: true, OriginalName: dirNameOnly, Contents: contents, LastModified: dstat.ModTime(), Mode: dstat.Mode()}
+	dirInfo := FileInfo{Exists: true, IsDir: true, Name: dirNameOnly, Contents: contents, LastModified: dstat.LastModified, Mode: dstat.Mode}
 
 	FileCache.Set(lowerCaseDirName, dirInfo)
 }
