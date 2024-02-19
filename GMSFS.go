@@ -882,7 +882,12 @@ func Stat(name string) (FileInfo, error) {
 
 	// Check if file information is available in the cache
 	if fileInfo, ok := FileCache.Get(lowerCaseName); ok {
-		return fileInfo, nil
+		if fileInfo.Name == "" {
+			errorPrinter("Found error with object: " + name + " fixing...")
+			FileCache.Remove(lowerCaseName)
+		} else {
+			return fileInfo, nil
+		}
 	}
 
 	// If not in cache, get file info from the filesystem
