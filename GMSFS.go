@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -1100,4 +1101,62 @@ func UpdateDirectoryContents(dirName string) {
 	dirInfo := FileInfo{Exists: true, IsDir: true, Name: dirNameOnly, Contents: contents, LastModified: dstat.LastModified, Mode: dstat.Mode}
 
 	FileCache.Set(lowerCaseDirName, dirInfo)
+}
+
+const shardCount = 32
+
+type SharedFileCache struct {
+	shards [shardCount]fileCacheShard
+}
+
+type fileCacheShard struct {
+	items map[string]*FileInfo
+	mx    sync.RWMutex
+}
+
+func (sc *SharedFileCache) getShardIndex(key string) uint8 {
+	// Use the fnv32 function for getting a hash value of the key
+	hash := fnv32(key)
+	// Use the remainder (modulo operation) to select a shard
+	index := hash % uint32(shardCount)
+	return uint8(index) // we're ok to convert it since shardCount < 256
+}
+
+// Get is a thread-safe way to get file info from the cache.
+func (sc *SharedFileCache) Get(key string) (*FileInfo, bool) {
+	shardIndex := sc.getShardIndex(key)
+	shard := &(sc.shards[shardIndex])
+
+	shard.mx.RLock()
+	value, ok := shard.items[key]
+	shard.mx.RUnlock()
+	return value, ok
+}
+
+// Set adds a FileInfo to the cache in a thread-safe way.
+func (sc *SharedFileCache) Set(key string, value *FileInfo) {
+	shardIndex := sc.getShardIndex(key)
+	shard := &(sc.shards[shardIndex])
+
+	shard.mx.Lock()
+	shard.items[key] = value
+	shard.mx.Unlock()
+}
+
+func newSharedFileCache() *SharedFileCache {
+	c := &SharedFileCache{}
+	for i := 0; i < shardCount; i++ {
+		c.shards[i].items = make(map[string]*FileInfo)
+	}
+	return c
+}
+
+func fnv32(key string) uint32 {
+	hash := uint32(2166136261)
+	const prime uint32 = 16777619
+	for i := 0; i < len(key); i++ {
+		hash ^= uint32(key[i])
+		hash *= prime
+	}
+	return hash
 }
