@@ -42,7 +42,8 @@ type FileHandleInstance struct {
 	Timer *time.Timer
 }
 
-func errorPrinter(log string) {
+func errorPrinter(log string, object string) {
+	go invistiageError(object)
 	if _, err := os.Stat("GMSFS.Debug"); err != nil {
 		if os.IsNotExist(err) {
 			return
@@ -60,6 +61,28 @@ func errorPrinter(log string) {
 	}
 
 	AppendStringToFile("GMSFS."+time.Now().Format(timeFlat)+".log", log+" stacktrace: "+stack+"\r\n")
+}
+
+// This function catches errors from the filecache - some errors can be that a file
+// was tried to op read that does not exist, other can be cache objects not consisten
+// with file system and needs to be fixed.
+func invistiageError(name string) {
+	if name == "" {
+		return
+	}
+	fmt.Println("Invistiage object: " + name)
+	_, ok := FileCache.Get(strings.ToLower(filepath.Clean(name)))
+	if ok == true {
+		_, err := os.Stat(filepath.Clean(name))
+		if err != nil {
+			//We know the filesystem seems to have a issue with this object, so we clean it form the cache
+			FileCache.Remove(filepath.Clean(name))
+
+			//We should also remove it from the parent directory file list
+			dir, file := filepath.Split(name)
+			removeObjectFromParentCache(dir, file)
+		}
+	}
 }
 
 func GetFileInfo(name string) (FileInfo, bool) {
@@ -98,7 +121,7 @@ func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 	file, err := os.OpenFile(name, flag, perm)
 	if err != nil {
-		errorPrinter("OpenFile: " + err.Error())
+		errorPrinter("OpenFile: "+err.Error(), name)
 		return nil, err
 	}
 
@@ -160,7 +183,7 @@ func (cf *CachedFile) Close() error {
 	// Update file info in cache before closing
 	stat, err := cf.File.Stat()
 	if err != nil {
-		errorPrinter("Close: " + err.Error())
+		errorPrinter("Close: "+err.Error(), cf.Name())
 		return err // or handle error differently
 	}
 
@@ -186,7 +209,7 @@ func Create(name string) (*CachedFile, error) {
 
 	file, err := os.Create(name)
 	if err != nil {
-		errorPrinter("Create: " + err.Error())
+		errorPrinter("Create: "+err.Error(), name)
 		return nil, err
 	}
 
@@ -201,7 +224,7 @@ func Open(name string) (*os.File, error) {
 	// Open the file using os.Open
 	file, err := os.Open(name)
 	if err != nil {
-		errorPrinter("Open: " + err.Error())
+		errorPrinter("Open: "+err.Error(), name)
 		return nil, err
 	}
 
@@ -210,7 +233,7 @@ func Open(name string) (*os.File, error) {
 		// If not in cache, get file info and update cache
 		stat, err := file.Stat()
 		if err != nil {
-			errorPrinter("Open: " + err.Error())
+			errorPrinter("Open: "+err.Error(), name)
 			file.Close()
 			return nil, err
 		}
@@ -240,7 +263,7 @@ func Delete(name string) error {
 	// Remove the file from the filesystem
 	err := os.Remove(name) // Use original case for filesystem operations
 	if err != nil {
-		errorPrinter("Delete: " + err.Error())
+		errorPrinter("Delete: "+err.Error(), name)
 		return err
 	}
 
@@ -261,7 +284,7 @@ func ReadFile(name string) ([]byte, error) {
 	// Read the file contents
 	content, err := os.ReadFile(name) // Use the original case for filesystem operations
 	if err != nil {
-		errorPrinter("ReadFile: " + err.Error())
+		errorPrinter("ReadFile: "+err.Error(), name)
 		return nil, err
 	}
 
@@ -293,7 +316,7 @@ func Mkdir(name string, perm os.FileMode) error {
 	name = filepath.Clean(name) // Preserve original name for file operation
 	err := os.Mkdir(name, perm)
 	if err != nil {
-		errorPrinter("Mkdir: " + err.Error())
+		errorPrinter("Mkdir: "+err.Error(), name)
 		return err
 	}
 
@@ -311,18 +334,20 @@ func MkdirAll(path string, perm os.FileMode) error {
 
 	fpath := strings.Replace(path, "\\", "/", -1)
 	ps := strings.Split(fpath, "/")
-	newPath := "/"
+	newPath := ""
 	for _, b := range ps {
-		if FileExists(filepath.Join(newPath, b)) == false {
-			errO := os.Mkdir(filepath.Join(newPath, b), perm)
-			if errO != nil {
-				errorPrinter("MkdirAll: " + errO.Error())
-				return errO
+		if b != "" {
+			if FileExists(newPath+"/"+b) == false {
+				errO := Mkdir(newPath+"/"+b, perm)
+				if errO != nil {
+					errorPrinter("MkdirAll: "+errO.Error(), newPath+"/"+b)
+					return errO
+				}
+				UpdateFileInfo(newPath + "/" + b)
+				updateCacheWithNewFile(newPath, b)
 			}
-			UpdateFileInfo(filepath.Join(newPath, b))
-			updateCacheWithNewFile(newPath, b)
+			newPath = newPath + "/" + b
 		}
-		newPath = newPath + "/" + b
 	}
 
 	return nil
@@ -348,7 +373,7 @@ func Append(name string, content []byte) error {
 	// Write the content to the file
 	written, err := file.Write(content)
 	if err != nil {
-		errorPrinter("Append: " + err.Error())
+		errorPrinter("Append: "+err.Error(), name)
 		return err
 	}
 
@@ -377,7 +402,7 @@ func WriteFile(name string, content []byte, perm os.FileMode) error {
 	// Write the new content to the file
 	err := os.WriteFile(name, content, perm)
 	if err != nil {
-		errorPrinter("WriteFile: " + err.Error())
+		errorPrinter("WriteFile: "+err.Error(), name)
 		return err
 	}
 
@@ -403,7 +428,7 @@ func FileSize(name string) (int64, error) {
 	// If not in cache, get file size from the filesystem
 	stat, err := os.Stat(name) // Original name for filesystem operation
 	if err != nil {
-		errorPrinter("FileSize: " + err.Error())
+		errorPrinter("FileSize: "+err.Error(), name)
 		return 0, err // File does not exist or other error occurred
 	}
 
@@ -443,10 +468,12 @@ func Rename(oldName, newName string) error {
 		ListFS(lowerOldName)
 	}
 
-	CloseFile(lowerOldName)
+	CloseFile(oldName)
+	CloseFile(newName)
 	err := os.Rename(oldName, newName)
 	if err != nil {
-		errorPrinter("Rename: " + err.Error())
+		errorPrinter("Rename: "+err.Error(), oldName)
+		errorPrinter("Rename: "+err.Error(), newName)
 		return err
 	}
 
@@ -475,14 +502,14 @@ func CopyFile(src, dst string) (err error) {
 
 	in, err := os.Open(src)
 	if err != nil {
-		errorPrinter("CopyFile (os.Open): " + err.Error())
+		errorPrinter("CopyFile (os.Open): "+err.Error(), src)
 		return
 	}
 	defer in.Close()
 
 	out, err := os.Create(dst)
 	if err != nil {
-		errorPrinter("CopyFile (os.Create): " + err.Error())
+		errorPrinter("CopyFile (os.Create): "+err.Error(), dst)
 		return
 	}
 	defer func() {
@@ -493,24 +520,24 @@ func CopyFile(src, dst string) (err error) {
 
 	_, err = io.Copy(out, in)
 	if err != nil {
-		errorPrinter("CopyFile (io.Copy): " + err.Error())
+		errorPrinter("CopyFile (io.Copy): "+err.Error(), "")
 		return
 	}
 
 	err = out.Sync()
 	if err != nil {
-		errorPrinter("CopyFile (out.Sync): " + err.Error())
+		errorPrinter("CopyFile (out.Sync): "+err.Error(), "")
 		return
 	}
 
 	si, err := os.Stat(src)
 	if err != nil {
-		errorPrinter("CopyFile (os.Stat): " + err.Error())
+		errorPrinter("CopyFile (os.Stat): "+err.Error(), "")
 		return
 	}
 	err = os.Chmod(dst, si.Mode())
 	if err != nil {
-		errorPrinter("CopyFile (os.Chmod): " + err.Error())
+		errorPrinter("CopyFile (os.Chmod): "+err.Error(), "")
 		return
 	}
 
@@ -528,7 +555,7 @@ func Remove(name string) error {
 
 	err := os.Remove(name)
 	if err != nil {
-		errorPrinter("Remove: " + err.Error())
+		errorPrinter("Remove: "+err.Error(), name)
 		return err
 	}
 
@@ -550,7 +577,7 @@ func CopyDir(src string, dst string) error {
 
 	si, err := Stat(src) // Stat uses cache
 	if err != nil {
-		errorPrinter("CopyDir (Stat): " + err.Error())
+		errorPrinter("CopyDir (Stat): "+err.Error(), src)
 		return err
 	}
 	if !si.IsDir {
@@ -559,27 +586,27 @@ func CopyDir(src string, dst string) error {
 
 	_, err = Stat(dst)
 	if err != nil {
-		errorPrinter("CopyDir (os.Stat): " + err.Error())
+		errorPrinter("CopyDir (os.Stat): "+err.Error(), dst)
 		return err
 	}
 	if !os.IsNotExist(err) {
 		return err
 	}
 	if err == nil {
-		errorPrinter("CopyDir: " + err.Error())
+		errorPrinter("CopyDir: "+err.Error(), "")
 		return fmt.Errorf("destination already exists")
 	}
 
 	err = MkdirAll(dst, si.Mode)
 	if err != nil {
-		errorPrinter("CopyDir (os.MkdirAll): " + err.Error())
+		errorPrinter("CopyDir (os.MkdirAll): "+err.Error(), dst)
 		return err
 	}
 	UpdateFileInfo(dst) // Update cache for the new directory
 
 	entries, err := ReadDir(src) // ReadDir uses cache
 	if err != nil {
-		errorPrinter("CopyDir (ReadDir): " + err.Error())
+		errorPrinter("CopyDir (ReadDir): "+err.Error(), src)
 		return err
 	}
 
@@ -590,7 +617,8 @@ func CopyDir(src string, dst string) error {
 		if entry.IsDir {
 			err = CopyDir(srcPath, dstPath)
 			if err != nil {
-				errorPrinter("CopyDir (CopyDir): " + err.Error())
+				errorPrinter("CopyDir (CopyDir-1): "+err.Error(), srcPath)
+				errorPrinter("CopyDir (CopyDir-2): "+err.Error(), dstPath)
 				return err
 			}
 			UpdateDirectoryContents(dstPath)
@@ -603,7 +631,8 @@ func CopyDir(src string, dst string) error {
 
 			err = CopyFile(srcPath, dstPath)
 			if err != nil {
-				errorPrinter("CopyDir (CopyFile): " + err.Error())
+				errorPrinter("CopyDir (CopyFile-1): "+err.Error(), srcPath)
+				errorPrinter("CopyDir (CopyFile-2): "+err.Error(), dstPath)
 				return err
 			}
 			updateCacheWithNewFile(dstPath, entry.Name)
@@ -623,7 +652,7 @@ func ReadDir(dirName string) ([]FileInfo, error) {
 		for _, fileName := range temp.Contents {
 			fileInfo, err := Stat(filepath.Join(dirName, fileName))
 			if err != nil {
-				errorPrinter("ReadDir (Stat): " + err.Error())
+				errorPrinter("ReadDir (Stat): "+err.Error(), filepath.Join(dirName, fileName))
 				return nil, err // Handle error appropriately
 			}
 			fileInfos = append(fileInfos, fileInfo)
@@ -634,7 +663,7 @@ func ReadDir(dirName string) ([]FileInfo, error) {
 	// If not in cache, read directory contents from the filesystem
 	fileEntries, err := os.ReadDir(dirName)
 	if err != nil {
-		errorPrinter("ReadDir (os.ReadDir): " + err.Error())
+		errorPrinter("ReadDir (os.ReadDir): "+err.Error(), dirName)
 		return nil, err
 	}
 
@@ -643,7 +672,7 @@ func ReadDir(dirName string) ([]FileInfo, error) {
 	for _, entry := range fileEntries {
 		entryStat, err := entry.Info()
 		if err != nil {
-			errorPrinter("ReadDir (loop): " + err.Error())
+			errorPrinter("ReadDir (loop): "+err.Error(), entry.Name())
 			return nil, err
 		}
 
@@ -679,7 +708,7 @@ func RemoveAll(path string) error {
 	path = filepath.Clean(path)
 	err := updateCacheAfterRemoveAll(strings.ToLower(path))
 	if err != nil {
-		errorPrinter("Remove: " + err.Error())
+		errorPrinter("Remove: "+err.Error(), path)
 		return err
 	}
 
@@ -693,7 +722,7 @@ func ListFS(path string) []string {
 	// First, check if the path is a directory
 	fileInfo, err := Stat(path)
 	if err != nil {
-		errorPrinter("ListFS (Stat): " + err.Error())
+		errorPrinter("ListFS (Stat): "+err.Error(), path)
 		return sysSlices // Return empty slice if there's an error
 	}
 	if !fileInfo.IsDir {
@@ -715,7 +744,7 @@ func ListFS(path string) []string {
 					sysSlices = append(sysSlices, f.Name)
 				}
 			} else {
-				errorPrinter("ListFS (Loop): " + err.Error())
+				errorPrinter("ListFS (Loop): "+err.Error(), fullPath)
 			}
 		}
 	} else {
@@ -737,7 +766,7 @@ func RecurseFS(path string) (sysSlices []string) {
 		for _, name := range temp.Contents {
 			fileInfo, err := Stat(filepath.Join(path, name)) // Use original path for stat
 			if err != nil {
-				errorPrinter("RecureseFS (Stat): " + err.Error())
+				errorPrinter("RecureseFS (Stat): "+err.Error(), filepath.Join(path, name))
 				continue // Handle error as needed
 			}
 			files = append(files, fileInfo)
@@ -746,7 +775,7 @@ func RecurseFS(path string) (sysSlices []string) {
 		var err error
 		files, err = ReadDir(path) // Read from filesystem if not in cache
 		if err != nil {
-			errorPrinter("RecurseFS (ReadDir): " + err.Error())
+			errorPrinter("RecurseFS (ReadDir): "+err.Error(), path)
 			return // Handle error as needed
 		}
 	}
@@ -775,7 +804,7 @@ func FileAgeInSec(filename string) (age time.Duration, err error) {
 		var stat FileInfo
 		stat, err = Stat(filename)
 		if err != nil {
-			errorPrinter("FileAgeInSec: " + err.Error())
+			errorPrinter("FileAgeInSec: "+err.Error(), filename)
 			return -1, err
 		}
 
@@ -800,7 +829,7 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 	// Check if source is a directory
 	srcInfo, err := Stat(src) // Use cached Stat
 	if err != nil {
-		errorPrinter("CopyDirFilesGlob: " + err.Error())
+		errorPrinter("CopyDirFilesGlob: "+err.Error(), src)
 		return fmt.Errorf("source is not a directory or does not exist")
 	}
 	if !srcInfo.IsDir {
@@ -811,7 +840,7 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 	if !FileExists(dst) {
 		err = MkdirAll(dst, srcInfo.Mode) // Use cached MkdirAll
 		if err != nil {
-			errorPrinter("CopyDirFilesGlob (MkdirAll): " + err.Error())
+			errorPrinter("CopyDirFilesGlob (MkdirAll): "+err.Error(), dst)
 			return
 		}
 	}
@@ -819,7 +848,7 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 	// Use CachedGlob to match files
 	matches, err := Glob(src + "/" + fileMatch)
 	if err != nil {
-		errorPrinter("CopyDirFilesGlob (Glob): " + err.Error())
+		errorPrinter("CopyDirFilesGlob (Glob): "+err.Error(), src+"/"+fileMatch)
 		return err
 	}
 
@@ -827,7 +856,8 @@ func CopyDirFilesGlob(src string, dst string, fileMatch string) (err error) {
 		itemBaseName := filepath.Base(item)
 		err = CopyFile(item, filepath.Join(dst, itemBaseName)) // Use cached CopyFile
 		if err != nil {
-			errorPrinter("CopyDirFilesGlob (CopyFile): " + err.Error())
+			errorPrinter("CopyDirFilesGlob (CopyFile-1): "+err.Error(), item)
+			errorPrinter("CopyDirFilesGlob (CopyFile-2): "+err.Error(), filepath.Join(dst, itemBaseName))
 			return
 		}
 	}
@@ -841,7 +871,7 @@ func Glob(pattern string) ([]string, error) {
 	// First, try to match the pattern with files in the cache
 	cachedMatches, errorZ := CachedGlob(pattern)
 	if errorZ != nil {
-		errorPrinter("Glob: " + errorZ.Error())
+		errorPrinter("Glob: "+errorZ.Error(), "")
 		return nil, errorZ
 	}
 
@@ -865,7 +895,7 @@ func CachedGlob(pattern string) ([]string, error) {
 		if fileInfo, ok := FileCache.Get(key); ok {
 			matched, err := filepath.Match(lowerCasePattern, strings.ToLower(fileInfo.Name))
 			if err != nil {
-				errorPrinter("CachedGlob: " + err.Error())
+				errorPrinter("CachedGlob: "+err.Error(), "")
 				return nil, err
 			}
 			if matched {
@@ -883,7 +913,6 @@ func Stat(name string) (FileInfo, error) {
 	// Check if file information is available in the cache
 	if fileInfo, ok := FileCache.Get(lowerCaseName); ok {
 		if fileInfo.Name == "" {
-			errorPrinter("Found error with object: " + name + " fixing...")
 			FileCache.Remove(lowerCaseName)
 		} else {
 			return fileInfo, nil
@@ -935,7 +964,7 @@ func updateCacheAfterRemoveAll(path string) error {
 
 	entries, err := ReadDir(path) // Original case for filesystem operation
 	if err != nil {
-		errorPrinter("updateCacheAfterRemoveAll: " + err.Error())
+		errorPrinter("updateCacheAfterRemoveAll: "+err.Error(), path)
 		return err
 	}
 	if !os.IsNotExist(err) {
@@ -948,7 +977,7 @@ func updateCacheAfterRemoveAll(path string) error {
 		if entry.IsDir {
 			err := updateCacheAfterRemoveAll(lowerCaseFullPath)
 			if err != nil {
-				errorPrinter("updateCacheAfterRemoveAll (updateCacheAfterRemoveAll): " + err.Error())
+				errorPrinter("updateCacheAfterRemoveAll (updateCacheAfterRemoveAll): "+err.Error(), lowerCaseFullPath)
 				return err
 			}
 		}
@@ -1087,7 +1116,7 @@ func UpdateDirectoryContents(dirName string) {
 
 	files, err := os.ReadDir(dirName) // Use the original case for filesystem operations
 	if err != nil {
-		errorPrinter("UpdateDirectoryContents (os.ReadDir): " + err.Error())
+		errorPrinter("UpdateDirectoryContents (os.ReadDir): "+err.Error(), dirName)
 		return // Handle error
 	}
 
@@ -1098,7 +1127,7 @@ func UpdateDirectoryContents(dirName string) {
 
 	dstat, err := Stat(dirName)
 	if err != nil {
-		errorPrinter("UpdateDirectoryContents (Stat): " + err.Error())
+		errorPrinter("UpdateDirectoryContents (Stat): "+err.Error(), dirName)
 		return
 	}
 
