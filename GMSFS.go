@@ -8,10 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -24,17 +24,33 @@ type FileInfo struct {
 	IsDir        bool
 	Contents     []string // Names of files for directories
 	Name         string
+	CacheTime    time.Time
+}
+
+type FileInfoRD struct {
+	FileInfoRD []FileInfo
+	CacheTime  time.Time
+}
+
+type CachedFile struct {
+	*os.File
+	path string
 }
 
 const timeFlat = "20060102_1504"
 
 // Global variables for caches
 var FileCache = cmap.New[FileInfo]()
-var FileHandleCache = cmap.New[*os.File]()
+var FileCacheRD = cmap.New[FileInfoRD]()
 
 // Global variables for file handles and timers
 var FileHandles = cmap.New[*os.File]()
 var FileTimers = cmap.New[*time.Timer]()
+
+var MaxCacheDepth = 3         //Max cache level
+var CacheRoot = "/autoupdate" //Only cache files and folders below this folder
+
+var _ = runloopCache()
 
 // FileHandleInstance to store file and timer information
 type FileHandleInstance struct {
@@ -70,6 +86,7 @@ func invistiageError(name string) {
 	if name == "" {
 		return
 	}
+	name = filepath.Clean(name)
 	fmt.Println("Invistiage object: " + name)
 	_, ok := FileCache.Get(strings.ToLower(filepath.Clean(name)))
 	if ok == true {
@@ -83,6 +100,99 @@ func invistiageError(name string) {
 			removeObjectFromParentCache(dir, file)
 		}
 	}
+}
+
+func runloopCache() string {
+	go loopCache()
+	return "running"
+}
+
+func loopCache() {
+	lc := 0
+	for {
+		looptimer := time.Now()
+		fc := FileCache.Items()
+		for a, b := range fc {
+			a := filepath.Clean(a)
+			//Clean up in negative cache
+			if b.Exists == false {
+				t := time.Now()
+				if t.Sub(b.CacheTime).Seconds() > 300 {
+					FileCache.Remove(a)
+				}
+			}
+			//Fix directory connections
+			if b.IsDir == true {
+				if inCacheScope(a) == true {
+					fl := b.Contents
+					//In cache check - compare objects to lists
+					errCount := 0
+					for _, obj := range fl {
+						if FileCache.Has(filepath.Join(a, strings.ToLower(obj))) == false {
+							errorPrinter("Cache inconsistency found: "+filepath.Join(a, strings.ToLower(obj))+" resetting cache for: "+a, "")
+							errCount += 1
+						}
+					}
+					if errCount > 0 {
+						fmt.Println("Found errors: " + strconv.Itoa(errCount) + " on: " + a)
+						ListFS(a)
+					}
+
+					//Ext cache check - compare cache to filesystem
+					if lc == 20 {
+						d, err := os.ReadDir(a)
+						if err != nil {
+							errorPrinter("Local dir error: "+err.Error(), "")
+						} else {
+							//Compare local file system to cache
+							for _, r := range d {
+								if slices.Contains(fl, r.Name()) == false {
+									errorPrinter("Error - object not found in cache: "+r.Name(), "")
+									Stat(filepath.Join(a, r.Name()))
+									UpdateDirectoryContents(a)
+								}
+							}
+
+							var tmpS []string
+							for _, i := range d {
+								tmpS = append(tmpS, i.Name())
+							}
+
+							//Compare cache to file system
+							for _, r := range fl {
+								if slices.Contains(tmpS, r) == false {
+									errorPrinter("Error - object not found in filesystem: "+r, "")
+									Stat(filepath.Join(a, r))
+									UpdateDirectoryContents(a)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		timeX := time.Now()
+		fmt.Println("loopCache took: ", timeX.Sub(looptimer))
+
+		if lc == 20 {
+			lc = 0
+		} else {
+			lc += 1
+		}
+
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func inCacheScope(a string) bool {
+	depth := filepath.SplitList(a)
+	if len(a) > len(CacheRoot) {
+		if len(depth) <= MaxCacheDepth+1 && strings.ToLower(a[:len(CacheRoot)]) == strings.ToLower(CacheRoot) {
+			return true
+		}
+	}
+	return false
 }
 
 func GetFileInfo(name string) (FileInfo, bool) {
@@ -174,11 +284,6 @@ func resetTimer(name string) {
 	}
 }
 
-type CachedFile struct {
-	*os.File
-	path string
-}
-
 func (cf *CachedFile) Close() error {
 	// Update file info in cache before closing
 	stat, err := cf.File.Stat()
@@ -194,12 +299,14 @@ func (cf *CachedFile) Close() error {
 		LastModified: stat.ModTime(),
 		IsDir:        false,
 		Name:         filepath.Base(cf.path),
+		CacheTime:    time.Now(),
 	}
 
 	lowerCasePath := strings.ToLower(cf.path)
-	FileCache.Set(lowerCasePath, fileInfo)
+	if inCacheScope(lowerCasePath) == true {
+		FileCache.Set(lowerCasePath, fileInfo)
+	}
 	updateCacheWithNewFile(filepath.Dir(cf.path), filepath.Base(cf.path))
-
 	// Now close the file
 	return cf.File.Close()
 }
@@ -245,8 +352,11 @@ func Open(name string) (*os.File, error) {
 			LastModified: stat.ModTime(),
 			IsDir:        stat.IsDir(),
 			Name:         name,
+			CacheTime:    time.Now(),
 		}
-		FileCache.Set(lowerCaseName, fileInfo)
+		if inCacheScope(lowerCaseName) {
+			FileCache.Set(lowerCaseName, fileInfo)
+		}
 	}
 
 	dir, fileX := filepath.Split(name)
@@ -290,7 +400,6 @@ func ReadFile(name string) ([]byte, error) {
 
 	// Update the cache with the current file information
 	UpdateFileInfo(name) // Use the original case for updating FileInfo
-
 	return content, nil
 }
 
@@ -303,10 +412,12 @@ func FileExists(name string) bool {
 
 	_, err := Stat(name)
 	if os.IsNotExist(err) {
-		FileCache.Set(lowerCaseName, FileInfo{Exists: false})
+		if inCacheScope(lowerCaseName) {
+			FileCache.Set(lowerCaseName, FileInfo{Exists: false, CacheTime: time.Now()})
+		}
 		return false
 	} else if err == nil {
-		UpdateFileInfo(name)
+		UpdateFileInfo(lowerCaseName)
 		return true
 	}
 	return false
@@ -332,24 +443,30 @@ func MkdirAll(path string, perm os.FileMode) error {
 		return nil
 	}
 
-	fpath := strings.Replace(path, "\\", "/", -1)
-	ps := strings.Split(fpath, "/")
-	newPath := ""
-	for _, b := range ps {
-		if b != "" {
-			if FileExists(newPath+"/"+b) == false {
-				errO := Mkdir(newPath+"/"+b, perm)
-				if errO != nil {
-					errorPrinter("MkdirAll: "+errO.Error(), newPath+"/"+b)
-					return errO
-				}
-				UpdateFileInfo(newPath + "/" + b)
-				updateCacheWithNewFile(newPath, b)
-			}
-			newPath = newPath + "/" + b
-		}
+	err := os.MkdirAll(path, perm)
+	if err != nil {
+		return err
 	}
 
+	UpdateDirectoryContents(path)
+	/*
+		ps := filepath.SplitList(path)
+		newPath := ""
+		for _, b := range ps {
+			if b != "" {
+				if FileExists(filepath.Join(newPath, b)) == false {
+					errO := Mkdir(filepath.Join(newPath, b), perm)
+					if errO != nil {
+						errorPrinter("MkdirAll: "+errO.Error(), newPath+"/"+b)
+						return errO
+					}
+					UpdateFileInfo(filepath.Join(newPath, b))
+					updateCacheWithNewFile(newPath, b)
+				}
+				newPath = newPath + "/" + b
+			}
+		}
+	*/
 	return nil
 }
 
@@ -377,14 +494,11 @@ func Append(name string, content []byte) error {
 		return err
 	}
 
-	// Reset the timer for the file handle
 	resetTimer(lowerCaseName)
-
-	UpdateFileInfo(name)
-
-	// Update file info in the cache
+	if FileCache.Has(lowerCaseName) == false {
+		UpdateFileInfo(name)
+	}
 	UpdateFileInfoWithSize(lowerCaseName, int64(written))
-
 	return nil
 }
 
@@ -411,7 +525,6 @@ func WriteFile(name string, content []byte, perm os.FileMode) error {
 
 	// Update the directory contents in the cache
 	updateCacheWithNewFile(filepath.Dir(name), filepath.Base(name))
-
 	return nil
 }
 
@@ -463,13 +576,19 @@ func FileSizeZeroOnError(name string) int64 {
 func Rename(oldName, newName string) error {
 	lowerOldName := strings.ToLower(filepath.Clean(oldName))
 	lowerNewName := strings.ToLower(filepath.Clean(newName))
+	fmt.Println(oldName, newName)
 
-	if FileCache.Has(lowerOldName) == false {
+	if lowerOldName == lowerNewName {
+		return nil
+	}
+
+	if FileCache.Has(lowerOldName) == true {
 		ListFS(lowerOldName)
 	}
 
 	CloseFile(oldName)
 	CloseFile(newName)
+
 	err := os.Rename(oldName, newName)
 	if err != nil {
 		errorPrinter("Rename: "+err.Error(), oldName)
@@ -477,22 +596,15 @@ func Rename(oldName, newName string) error {
 		return err
 	}
 
-	if fileInfo, ok := FileCache.Get(lowerOldName); ok {
-		fileInfo.Name = filepath.Base(newName) // Update with the new name
+	FileCache.Remove(lowerOldName)
+	dir, _ := filepath.Split(lowerOldName)
+	UpdateDirectoryContents(dir)
+	dir, _ = filepath.Split(lowerNewName)
+	UpdateDirectoryContents(dir)
 
-		if fileInfo.IsDir {
-			UpdateCacheForRenamedDirectory(filepath.Clean(oldName), filepath.Clean(newName))
-		} else {
-			// Update the cache with the new file information
-			FileCache.Set(lowerNewName, fileInfo)
-			FileCache.Remove(lowerOldName)
-
-			// Update parent directory's cache for both old and new locations
-			updateCacheWithNewFile(filepath.Dir(newName), filepath.Base(newName))
-			removeObjectFromParentCache(filepath.Dir(oldName), filepath.Base(oldName))
-		}
-	}
-
+	// Update parent directory's cache for both old and new locations
+	updateCacheWithNewFile(filepath.Dir(newName), filepath.Base(newName))
+	removeObjectFromParentCache(filepath.Dir(oldName), filepath.Base(oldName))
 	return nil
 }
 
@@ -553,16 +665,18 @@ func Remove(name string) error {
 
 	CloseFile(lowerCaseName)
 
+	FileCache.Remove(lowerCaseName)
+
+	dir, file := filepath.Split(name)
+	removeObjectFromParentCache(dir, file)
+
 	err := os.Remove(name)
 	if err != nil {
 		errorPrinter("Remove: "+err.Error(), name)
 		return err
 	}
 
-	FileCache.Remove(lowerCaseName)
-
-	dir, file := filepath.Split(name)
-	removeObjectFromParentCache(dir, file)
+	UpdateDirectoryContents(dir)
 
 	return nil
 }
@@ -602,8 +716,7 @@ func CopyDir(src string, dst string) error {
 		errorPrinter("CopyDir (os.MkdirAll): "+err.Error(), dst)
 		return err
 	}
-	UpdateFileInfo(dst) // Update cache for the new directory
-
+	UpdateFileInfo(dst)          // Update cache for the new directory
 	entries, err := ReadDir(src) // ReadDir uses cache
 	if err != nil {
 		errorPrinter("CopyDir (ReadDir): "+err.Error(), src)
@@ -636,7 +749,6 @@ func CopyDir(src string, dst string) error {
 				return err
 			}
 			updateCacheWithNewFile(dstPath, entry.Name)
-			//UpdateFileInfo(dstPath) // Update cache for the new file
 		}
 	}
 
@@ -646,36 +758,35 @@ func CopyDir(src string, dst string) error {
 func ReadDir(dirName string) ([]FileInfo, error) {
 	lowerCaseDirName := strings.ToLower(filepath.Clean(dirName))
 
-	// Check if directory contents are available in the cache
-	if temp, ok := FileCache.Get(lowerCaseDirName); ok && temp.IsDir {
-		var fileInfos []FileInfo
-		for _, fileName := range temp.Contents {
-			fileInfo, err := Stat(filepath.Join(dirName, fileName))
-			if err != nil {
-				errorPrinter("ReadDir (Stat): "+err.Error(), filepath.Join(dirName, fileName))
-				return nil, err // Handle error appropriately
+	rd, ok := FileCacheRD.Get(lowerCaseDirName)
+	if ok == true {
+		fc, ok := FileCache.Get(lowerCaseDirName)
+		if ok == true {
+			if fc.CacheTime.Sub(rd.CacheTime).Milliseconds() > 0 {
+				FileCacheRD.Remove(lowerCaseDirName)
+			} else {
+				return rd.FileInfoRD, nil
 			}
-			fileInfos = append(fileInfos, fileInfo)
+		} else {
+			return rd.FileInfoRD, nil
 		}
-		return fileInfos, nil
 	}
-
-	// If not in cache, read directory contents from the filesystem
-	fileEntries, err := os.ReadDir(dirName)
+	f, err := os.Open(dirName)
 	if err != nil {
-		errorPrinter("ReadDir (os.ReadDir): "+err.Error(), dirName)
 		return nil, err
 	}
+	defer f.Close()
 
+	dirs, err := f.ReadDir(-1)
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
 	var contents []string
-	var fileInfos []FileInfo
-	for _, entry := range fileEntries {
+	rds := FileInfoRD{}
+	for _, entry := range dirs {
 		entryStat, err := entry.Info()
 		if err != nil {
 			errorPrinter("ReadDir (loop): "+err.Error(), entry.Name())
 			return nil, err
 		}
-
 		// Convert os.FileInfo to your FileInfo struct
 		fileInfo := FileInfo{
 			Exists:       true,
@@ -686,22 +797,26 @@ func ReadDir(dirName string) ([]FileInfo, error) {
 			Name:         entryStat.Name(),
 		}
 
-		if entryStat.IsDir() {
-			UpdateDirectoryContents(filepath.Join(dirName, entryStat.Name()))
-		}
-
-		fileInfos = append(fileInfos, fileInfo)
+		//		if entryStat.IsDir() {
+		//			UpdateDirectoryContents(filepath.Join(dirName, entryStat.Name()))
+		//		}
+		rds.FileInfoRD = append(rds.FileInfoRD, fileInfo)
 		contents = append(contents, entryStat.Name())
 	}
-	dirNameOnly := filepath.Base(dirName)
-	FileCache.Set(lowerCaseDirName, FileInfo{
-		Exists:   true,
-		IsDir:    true,
-		Contents: contents,
-		Name:     dirNameOnly,
-	})
+	rds.CacheTime = time.Now()
+	FileCacheRD.Set(lowerCaseDirName, rds)
 
-	return fileInfos, nil
+	if inCacheScope(dirName) {
+		dirNameOnly := filepath.Base(dirName)
+		FileCache.Set(lowerCaseDirName, FileInfo{
+			Exists:    true,
+			IsDir:     true,
+			Contents:  contents,
+			Name:      dirNameOnly,
+			CacheTime: time.Now(),
+		})
+	}
+	return rds.FileInfoRD, nil
 }
 
 func RemoveAll(path string) error {
@@ -729,30 +844,23 @@ func ListFS(path string) []string {
 		return sysSlices // Return empty slice if it's not a directory
 	}
 
-	if temp, ok := FileCache.Get(lowerCasePath); ok && temp.IsDir {
-		if len(temp.Contents) == 0 {
-			UpdateDirectoryContents(path)
-		}
-		for _, name := range temp.Contents {
-			fullPath := filepath.Join(path, name)
-			f, err := Stat(fullPath)
-			if err == nil {
-				if f.IsDir {
-					sysSlices = append(sysSlices, "*"+f.Name)
-					UpdateDirectoryContents(fullPath)
-				} else {
-					sysSlices = append(sysSlices, f.Name)
-				}
+	if len(fileInfo.Contents) == 0 {
+		UpdateDirectoryContents(path)
+	}
+
+	//Build the directory from disk
+	objs, err := ReadDir(lowerCasePath)
+	if err == nil {
+		for _, fi := range objs {
+			if fi.IsDir {
+				sysSlices = append(sysSlices, "*"+fi.Name)
 			} else {
-				errorPrinter("ListFS (Loop): "+err.Error(), fullPath)
+				sysSlices = append(sysSlices, fi.Name)
 			}
 		}
 	} else {
-		// Read directory contents from the filesystem
-		UpdateDirectoryContents(path)
-		return ListFS(path) // Recurse with updated cache
+		errorPrinter("ListFS: 9"+err.Error(), "")
 	}
-
 	return sysSlices
 }
 
@@ -815,8 +923,11 @@ func FileAgeInSec(filename string) (age time.Duration, err error) {
 			LastModified: stat.LastModified,
 			IsDir:        stat.IsDir,
 			Name:         filename,
+			CacheTime:    time.Now(),
 		}
-		FileCache.Set(lowerCaseFilename, fileInfo)
+		if inCacheScope(lowerCaseFilename) {
+			FileCache.Set(lowerCaseFilename, fileInfo)
+		}
 	}
 
 	return time.Now().Sub(fileInfo.LastModified), nil
@@ -910,12 +1021,14 @@ func CachedGlob(pattern string) ([]string, error) {
 func Stat(name string) (FileInfo, error) {
 	lowerCaseName := strings.ToLower(filepath.Clean(name))
 
-	// Check if file information is available in the cache
-	if fileInfo, ok := FileCache.Get(lowerCaseName); ok {
-		if fileInfo.Name == "" {
-			FileCache.Remove(lowerCaseName)
-		} else {
-			return fileInfo, nil
+	if inCacheScope(lowerCaseName) {
+		// Check if file information is available in the cache
+		if fileInfo, ok := FileCache.Get(lowerCaseName); ok {
+			if fileInfo.Name == "" {
+				FileCache.Remove(lowerCaseName)
+			} else {
+				return fileInfo, nil
+			}
 		}
 	}
 
@@ -934,13 +1047,15 @@ func Stat(name string) (FileInfo, error) {
 		LastModified: stat.ModTime(),
 		IsDir:        stat.IsDir(),
 		Name:         dirNameOnly, // Store the original name
+		CacheTime:    time.Now(),
 	}
 
-	// Update the cache with this new information
-	FileCache.Set(lowerCaseName, info)
-
-	if info.IsDir {
-		UpdateDirectoryContents(name)
+	if inCacheScope(lowerCaseName) {
+		// Update the cache with this new information
+		FileCache.Set(lowerCaseName, info)
+		if info.IsDir {
+			UpdateDirectoryContents(name)
+		}
 	}
 
 	return info, nil
@@ -953,7 +1068,9 @@ func Update(name string, info FileInfo) {
 		// Preserve the original name in FileInfo
 		namex := filepath.Base(name)
 		info.Name = namex
-		FileCache.Set(lowerCaseName, info)
+		if inCacheScope(lowerCaseName) {
+			FileCache.Set(lowerCaseName, info)
+		}
 	} else {
 		FileCache.Remove(lowerCaseName)
 	}
@@ -1008,7 +1125,9 @@ func updateCacheWithNewFile(dirName, fileName string) {
 				return strings.ToLower(dirInfo.Contents[i]) < strings.ToLower(dirInfo.Contents[j])
 			})
 
-			FileCache.Set(lowerCaseDirName, dirInfo)
+			if inCacheScope(lowerCaseDirName) {
+				FileCache.Set(lowerCaseDirName, dirInfo)
+			}
 		}
 	} else {
 		UpdateDirectoryContents(dirName)
@@ -1030,7 +1149,9 @@ func removeObjectFromParentCache(dirName, fileName string) {
 				}
 			}
 			dirInfo.Contents = updatedContents
-			FileCache.Set(lowerCaseDirName, dirInfo)
+			if inCacheScope(lowerCaseDirName) {
+				FileCache.Set(lowerCaseDirName, dirInfo)
+			}
 		}
 	}
 }
@@ -1053,14 +1174,18 @@ func UpdateCacheForRenamedDirectory(oldDir, newDir string) {
 			// Update the cache entry for each file/subdirectory
 			if fileInfo, ok := FileCache.Get(oldPath); ok {
 				fileInfo.Name = filepath.Base(newPath) // Update OriginalName
-				FileCache.Set(newPath, fileInfo)
+				if inCacheScope(newPath) {
+					FileCache.Set(newPath, fileInfo)
+				}
 				FileCache.Remove(oldPath)
 			}
 		}
 
 		// Finally, update the cache entry for the directory itself
 		dirInfo.Name = filepath.Base(newDir)
-		FileCache.Set(newDir, dirInfo)
+		if inCacheScope(newDir) {
+			FileCache.Set(newDir, dirInfo)
+		}
 		FileCache.Remove(oldDir)
 	}
 	dir, file := filepath.Split(oldDir)
@@ -1073,7 +1198,9 @@ func UpdateFileInfoWithSize(name string, sizeIncrement int64) {
 		updatedFileInfo := fileInfo
 		updatedFileInfo.Size += sizeIncrement
 		updatedFileInfo.LastModified = time.Now() // Update the last modified time
-		FileCache.Set(lowerCaseName, updatedFileInfo)
+		if inCacheScope(lowerCaseName) {
+			FileCache.Set(lowerCaseName, updatedFileInfo)
+		}
 	} else {
 		// If the file is not in cache, retrieve the full info
 		UpdateFileInfo(name)
@@ -1088,7 +1215,7 @@ func UpdateFileInfo(name string) {
 	stat, err := os.Stat(name) // Use the original case for filesystem operations
 	if err != nil {
 		if os.IsNotExist(err) {
-			info = FileInfo{Exists: false}
+			info = FileInfo{Exists: false, CacheTime: time.Now()}
 		} else {
 			return // Handle other potential errors
 		}
@@ -1100,11 +1227,19 @@ func UpdateFileInfo(name string) {
 			LastModified: stat.ModTime(),
 			IsDir:        stat.IsDir(),
 			Name:         stat.Name(), // Preserve the original file name
+			CacheTime:    time.Now(),
 		}
+		if stat.IsDir() {
+			info.Contents = ListFS(name)
+		}
+
 	}
 
-	// Update the FileCache
-	FileCache.Set(lowerCaseName, info)
+	if inCacheScope(lowerCaseName) {
+		// Update the FileCache
+		FileCache.Set(lowerCaseName, info)
+	}
+
 	if info.IsDir {
 		UpdateDirectoryContents(name)
 	}
@@ -1113,6 +1248,8 @@ func UpdateFileInfo(name string) {
 func UpdateDirectoryContents(dirName string) {
 	dirName = filepath.Clean(dirName)
 	lowerCaseDirName := strings.ToLower(dirName)
+
+	FileCacheRD.Remove(lowerCaseDirName)
 
 	files, err := os.ReadDir(dirName) // Use the original case for filesystem operations
 	if err != nil {
@@ -1134,63 +1271,7 @@ func UpdateDirectoryContents(dirName string) {
 	dirNameOnly := filepath.Base(dirName) // Get only the directory name
 	dirInfo := FileInfo{Exists: true, IsDir: true, Name: dirNameOnly, Contents: contents, LastModified: dstat.LastModified, Mode: dstat.Mode}
 
-	FileCache.Set(lowerCaseDirName, dirInfo)
-}
-
-const shardCount = 32
-
-type SharedFileCache struct {
-	shards [shardCount]fileCacheShard
-}
-
-type fileCacheShard struct {
-	items map[string]*FileInfo
-	mx    sync.RWMutex
-}
-
-func (sc *SharedFileCache) getShardIndex(key string) uint8 {
-	// Use the fnv32 function for getting a hash value of the key
-	hash := fnv32(key)
-	// Use the remainder (modulo operation) to select a shard
-	index := hash % uint32(shardCount)
-	return uint8(index) // we're ok to convert it since shardCount < 256
-}
-
-// Get is a thread-safe way to get file info from the cache.
-func (sc *SharedFileCache) Get(key string) (*FileInfo, bool) {
-	shardIndex := sc.getShardIndex(key)
-	shard := &(sc.shards[shardIndex])
-
-	shard.mx.RLock()
-	value, ok := shard.items[key]
-	shard.mx.RUnlock()
-	return value, ok
-}
-
-// Set adds a FileInfo to the cache in a thread-safe way.
-func (sc *SharedFileCache) Set(key string, value *FileInfo) {
-	shardIndex := sc.getShardIndex(key)
-	shard := &(sc.shards[shardIndex])
-
-	shard.mx.Lock()
-	shard.items[key] = value
-	shard.mx.Unlock()
-}
-
-func newSharedFileCache() *SharedFileCache {
-	c := &SharedFileCache{}
-	for i := 0; i < shardCount; i++ {
-		c.shards[i].items = make(map[string]*FileInfo)
+	if inCacheScope(lowerCaseDirName) {
+		FileCache.Set(lowerCaseDirName, dirInfo)
 	}
-	return c
-}
-
-func fnv32(key string) uint32 {
-	hash := uint32(2166136261)
-	const prime uint32 = 16777619
-	for i := 0; i < len(key); i++ {
-		hash ^= uint32(key[i])
-		hash *= prime
-	}
-	return hash
 }
