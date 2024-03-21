@@ -555,6 +555,8 @@ func Rename(oldName, newName string) error {
 	CloseFile(oldName)
 	CloseFile(newName)
 
+	FileCache.Remove(lowerOldName)
+
 	err := os.Rename(oldName, newName)
 	if err != nil {
 		errorPrinter("Rename: "+err.Error(), oldName)
@@ -656,16 +658,8 @@ func CopyDir(src string, dst string) error {
 		return fmt.Errorf("source is not a directory")
 	}
 
-	_, err = Stat(dst)
-	if err != nil {
-		errorPrinter("CopyDir (os.Stat): "+err.Error(), dst)
-		return err
-	}
-	if !os.IsNotExist(err) {
-		return err
-	}
-	if err == nil {
-		errorPrinter("CopyDir: "+err.Error(), "")
+	if FileExists(dst) == true {
+		errorPrinter("CopyDir: File already exist", dst)
 		return fmt.Errorf("destination already exists")
 	}
 
