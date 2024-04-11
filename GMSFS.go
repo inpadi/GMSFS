@@ -822,24 +822,27 @@ func ListFS(path string) []string {
 func RecurseFS(path string) (sysSlices []string) {
 	lowerCasePath := strings.ToLower(filepath.Clean(path))
 
-	temp, ok := FileCache.Get(lowerCasePath)
+	//	temp, ok := FileCache.Get(lowerCasePath)
 	var files []FileInfo
 
-	if ok && temp.IsDir {
-		for _, name := range temp.Contents {
-			fileInfo, err := Stat(filepath.Join(path, name)) // Use original path for stat
+	stat, err := Stat(lowerCasePath)
+	if err != nil {
+		return sysSlices
+	}
+
+	temp, err := ReadDir(lowerCasePath)
+	if err != nil {
+		return sysSlices
+	}
+
+	if stat.IsDir {
+		for _, name := range temp {
+			fileInfo, err := Stat(filepath.Join(path, name.Name)) // Use original path for stat
 			if err != nil {
-				errorPrinter("RecureseFS (Stat): "+err.Error(), filepath.Join(path, name))
+				errorPrinter("RecureseFS (Stat): "+err.Error(), filepath.Join(path, name.Name))
 				continue // Handle error as needed
 			}
 			files = append(files, fileInfo)
-		}
-	} else {
-		var err error
-		files, err = ReadDir(path) // Read from filesystem if not in cache
-		if err != nil {
-			errorPrinter("RecurseFS (ReadDir): "+err.Error(), path)
-			return // Handle error as needed
 		}
 	}
 
