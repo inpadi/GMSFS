@@ -3,7 +3,6 @@ package GMSFS
 import (
 	"errors"
 	"fmt"
-	cmap "github.com/orcaman/concurrent-map/v2"
 	"io"
 	"log"
 	"os"
@@ -35,10 +34,6 @@ type CachedFile struct {
 }
 
 const timeFlat = "20060102_1504"
-
-// Global variables for file handles and timers
-var FileHandles = cmap.New[*os.File]()
-var FileTimers = cmap.New[*time.Timer]()
 
 // FileHandleInstance to store file and timer information
 type FileHandleInstance struct {
@@ -146,17 +141,12 @@ func cleanPath(path string) string {
 }
 
 func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
-	lowerCaseName := strings.ToLower(cleanPath(name))
-	CloseFile(lowerCaseName)
-
+	lowerCaseName := strings.ToLower(name)
 	file, err := os.OpenFile(name, flag, perm)
 	if err != nil {
 		errorPrinter("OpenFile: "+err.Error(), name)
 		return nil, err
 	}
-
-	FileHandles.Set(lowerCaseName, file)
-	resetTimer(lowerCaseName)
 
 	// Check if the file was newly created and update cache
 	if flag&os.O_CREATE != 0 {
@@ -164,43 +154,28 @@ func OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 		UpdateDirectoryContents(filepath.Dir(name))
 	}
 
-	return file, nil
-}
-
-func CloseFile(name string) {
-	lowerCaseName := strings.ToLower(cleanPath(name))
-
-	// Iterate over all file handles and close those in the specified directory
-	for _, key := range FileHandles.Keys() {
-		if strings.HasPrefix(key, lowerCaseName) {
-			// Close individual file handle
-			if file, ok := FileHandles.Get(key); ok {
-				stat, err := file.Stat()
-				if err == nil {
-					UpdateFileInfoWithSize(key, stat.Size())
-				}
-				file.Close()
-				FileHandles.Remove(key)
-			}
-
-			if timer, ok := FileTimers.Get(key); ok {
-				timer.Stop()
-				FileTimers.Remove(key)
-			}
+	// Check if file info is already in the cache
+	if _, ok := CacheGet(lowerCaseName); !ok {
+		// If not in cache, get file info and update cache
+		stat, err := file.Stat()
+		if err != nil {
+			errorPrinter("Open: "+err.Error(), name)
+			file.Close()
+			return nil, err
 		}
-	}
-}
 
-func resetTimer(name string) {
-	lowerCaseName := strings.ToLower(cleanPath(name))
-	if timer, ok := FileTimers.Get(lowerCaseName); ok {
-		timer.Reset(2 * time.Minute)
-	} else {
-		timer := time.AfterFunc(2*time.Minute, func() {
-			CloseFile(lowerCaseName)
-		})
-		FileTimers.Set(lowerCaseName, timer)
+		fileInfo := FileInfo{
+			Exists:       true,
+			Size:         stat.Size(),
+			Mode:         stat.Mode(),
+			LastModified: stat.ModTime(),
+			IsDir:        stat.IsDir(),
+			Name:         name,
+		}
+		CacheAdd(lowerCaseName, fileInfo)
 	}
+
+	return file, nil
 }
 
 func (cf *CachedFile) Close() error {
@@ -282,8 +257,6 @@ func Open(name string) (*os.File, error) {
 
 func Delete(name string) error {
 	lowerCaseName := strings.ToLower(cleanPath(name))
-	// Close the file handle if it exists
-	CloseFile(lowerCaseName)
 
 	// Remove the file from the filesystem
 	err := os.Remove(name) // Use original case for filesystem operations
@@ -300,10 +273,6 @@ func Delete(name string) error {
 }
 
 func ReadFile(name string) ([]byte, error) {
-	lowerCaseName := strings.ToLower(cleanPath(name))
-	// Close any open file handle before reading
-	CloseFile(lowerCaseName)
-
 	// Read the file contents
 	content, err := os.ReadFile(name) // Use the original case for filesystem operations
 	if err != nil {
@@ -339,8 +308,8 @@ func Mkdir(name string, perm os.FileMode) error {
 		return err
 	}
 
-	CacheDelete(strings.ToLower(filepath.Dir(name)))
 	UpdateFileInfo(name) // Use the original name
+	UpdateDirectoryContents(filepath.Dir(name))
 	return nil
 }
 
@@ -356,8 +325,8 @@ func MkdirAll(path string, perm os.FileMode) error {
 		return err
 	}
 
-	CacheDelete(filepath.Dir(path))
 	UpdateDirectoryContents(path)
+	UpdateDirectoryContents(filepath.Dir(path))
 
 	return nil
 }
@@ -367,17 +336,12 @@ func Append(name string, content []byte) error {
 	var file *os.File
 	var err error
 
-	// Check if file handle exists in the map
-	if temp, ok := FileHandles.Get(lowerCaseName); ok {
-		file = temp
-	} else {
-		// If not, open the file and store the handle in the map
-		file, err = os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-		if err != nil {
-			return err
-		}
-		FileHandles.Set(lowerCaseName, file)
+	// If not, open the file and store the handle in the map
+	file, err = os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return err
 	}
+	defer file.Close()
 
 	// Write the content to the file
 	written, err := file.Write(content)
@@ -386,7 +350,6 @@ func Append(name string, content []byte) error {
 		return err
 	}
 
-	resetTimer(lowerCaseName)
 	_, b := CacheGet(lowerCaseName)
 	if b == false {
 		UpdateFileInfo(name)
@@ -404,13 +367,11 @@ func WriteFile(name string, content []byte, perm os.FileMode) error {
 	name = cleanPath(name)
 	lowerCaseName := strings.ToLower(name)
 
-	// Close any open file handle before writing
-	CloseFile(lowerCaseName)
-
 	// Write the new content to the file
 	err := os.WriteFile(name, content, perm)
 
 	CacheDelete(filepath.Dir(lowerCaseName))
+	CacheDelete(lowerCaseName)
 	if err != nil {
 		return err
 	}
@@ -472,9 +433,6 @@ func Rename(oldName, newName string) error {
 		return nil
 	}
 
-	CloseFile(oldName)
-	CloseFile(newName)
-
 	err := os.Rename(oldName, newName)
 	if err != nil {
 		errorPrinter("Rename: "+err.Error(), oldName)
@@ -492,9 +450,6 @@ func Rename(oldName, newName string) error {
 func CopyFile(src, dst string) (err error) {
 	src = cleanPath(src)
 	dst = cleanPath(dst)
-
-	CloseFile(src)
-	CloseFile(dst)
 
 	in, err := os.Open(src)
 	if err != nil {
@@ -544,8 +499,6 @@ func CopyFile(src, dst string) (err error) {
 
 func Remove(name string) error {
 	lowerCaseName := strings.ToLower(cleanPath(name))
-
-	CloseFile(lowerCaseName)
 
 	CacheDelete(lowerCaseName)
 
